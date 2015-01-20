@@ -342,6 +342,9 @@ struct mm_rss_stat {
 };
 
 struct kioctx_table;
+#ifndef CONFIG_MAPPING_CACHE
+#define CONFIG_MAPPING_CACHE
+#endif
 struct mm_struct {
 	struct vm_area_struct *mmap;		/* list of VMAs */
 	struct rb_root mm_rb;

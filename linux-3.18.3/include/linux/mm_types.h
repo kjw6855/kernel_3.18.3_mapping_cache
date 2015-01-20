@@ -454,7 +454,25 @@ struct mm_struct {
 	bool tlb_flush_pending;
 #endif
 	struct uprobes_state uprobes_state;
+
+/*
+ * Made by Jiwon Kim
+ * 1. Set History Log
+ *
+ */
+#ifdef CONFIG_MAPPING_CACHE
+	struct mapping_history mhlist;
+#endif
 };
+
+#ifdef CONFIG_MAPPING_CACHE
+struct mapping_history{
+	struct list_head list;
+	int count;
+	char * file_path;
+	struct inode *inode;
+};
+#endif
 
 static inline void mm_init_cpumask(struct mm_struct *mm)
 {

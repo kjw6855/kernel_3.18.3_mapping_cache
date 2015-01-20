@@ -1361,6 +1361,57 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 		default:
 			return -EINVAL;
 		}
+#ifdef CONFIG_MAPPING_CACHE
+		struct list_head *entry;
+		struct mapping_history *mhtarget, *new;
+		char * file_path;
+		struct path *path;
+		int count = 0;
+		char *tmp;
+
+		//0. find file path
+		path = &file->f_path;
+		path_get(path);
+
+		tmp = (char *)__get_free_page(GFP_TEMPORARY);
+	
+		if(!tmp){
+			path_put(path);
+			return -ENOMEM;
+		}
+
+		file_path = d_path(path, tmp, PAGE_SIZE);
+		path_put(path);
+
+		if(IS_ERR(file_path)){
+			free_page((unsigned long) tmp);
+			return PTR_ERR(file_path);
+		}
+
+		//1. find from mapping history list of current mm
+		list_for_each(entry, &mm->mhlist){
+			mhtarget = list_entry(entry, struct mapping_history, list);
+			if(mhtarget->file_name == file){
+				count = mhtarget->count ++;
+				free_page((unsigned long)tmp);
+				break;
+			}
+		}
+
+		//2. if not found, allocate history list and append it
+		if(count == 0){
+			new = kmalloc(sizeof(struct mapping_history), GFP_KERNEL);
+			if(!new){
+				printk(KERN_INFO "mapping history struct kmalloc is failed\n");
+				return -ENOMEM;
+			}
+			new->count = 1;
+			new->file_path = file_path;
+			list_add(new, &mm->mhlist);
+		}
+
+		printk(KERN_INFO "[ARCS] %s file is mmaped with cnt[%d]\n", file_path, count);
+#endif
 	} else {
 		switch (flags & MAP_TYPE) {
 		case MAP_SHARED:

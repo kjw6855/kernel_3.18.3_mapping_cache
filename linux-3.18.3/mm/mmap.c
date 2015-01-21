@@ -553,451 +553,7 @@ anon_vma_interval_tree_post_update_vma(struct vm_area_struct *vma)
 
 static int find_vma_links(struct mm_struct *mm, unsigned long addr,
 		unsigned long end, struct vm_area_struct **pprev,
-		struct rb_nodtruct vm_area_struct, vm_rb);
-	*rb_link = __rb_link;
-	*rb_parent = __rb_parent;
-	return 0;
-}
-
-static unsigned long count_vma_pages_range(struct mm_struct *mm,
-		unsigned long addr, unsigned long end)
-{
-	unsigned long nr_pages = 0;
-	struct vm_area_struct *vma;
-
-	/* Find first overlaping mapping */
-	vma = find_vma_intersection(mm, addr, end);
-	if (!vma)
-		return 0;
-
-	nr_pages = (min(end, vma->vm_end) -
-		max(addr, vma->vm_start)) >> PAGE_SHIFT;
-
-	/* Iterate over the rest of the overlaps */
-	for (vma = vma->vm_next; vma; vma = vma->vm_next) {
-		unsigned long overlap_len;
-
-		if (vma->vm_start > end)
-			break;
-
-		overlap_len = min(end, vma->vm_end) - vma->vm_start;
-		nr_pages += overlap_len >> PAGE_SHIFT;
-	}
-
-	return nr_pages;
-}
-
-void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
-		struct rb_node **rb_link, struct rb_node *rb_parent)
-{
-	/* Update tracking information for the gap following the new vma. */
-	if (vma->vm_next)
-		vma_gap_update(vma->vm_next);
-	else
-		mm->highest_vm_end = vma->vm_end;
-
-	/*
-	 * vma->vm_prev wasn't known when we followed the rbtree to find the
-	 * correct insertion point for that vma. As a result, we could not
-	 * update the vma vm_rb parents rb_subtree_gap values on the way down.
-	 * So, we first insert the vma with a zero rb_subtree_gap value
-	 * (to be consistent with what we did on the way down), and then
-	 * immediately update the gap to the correct value. Finally we
-	 * rebalance the rbtree after all augmented values have been set.
-	 */
-	rb_link_node(&vma->vm_rb, rb_parent, rb_link);
-	vma->rb_subtree_gap = 0;
-	vma_gap_update(vma);
-	vma_rb_insert(vma, &mm->mm_rb);
-}
-
-static void __vma_link_file(struct vm_area_struct *vma)
-{
-	struct file *file;
-
-	file = vma->vm_file;
-	if (file) {
-		struct address_space *mapping = file->f_mapping;
-
-		if (vma->vm_flags & VM_DENYWRITE)
-			atomic_dec(&file_inode(file)->i_writecount);
-		if (vma->vm_flags & VM_SHARED)
-			atomic_inc(&mapping->i_mmap_writable);
-
-		flush_dcache_mmap_lock(mapping);
-		if (unlikely(vma->vm_flags & VM_NONLINEAR))
-			vma_nonlinear_insert(vma, &mapping->i_mmap_nonlinear);
-		else
-			vma_interval_tree_insert(vma, &mapping->i_mmap);
-		flush_dcache_mmap_unlock(mapping);
-	}
-}
-
-static void
-__vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
-	struct vm_area_struct *prev, struct rb_node **rb_link,
-	struct rb_node *rb_parent)
-{
-	__vma_link_list(mm, vma, prev, rb_parent);
-	__vma_link_rb(mm, vma, rb_link, rb_parent);
-}
-
-static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
-			struct vm_area_struct *prev, struct rb_node **rb_link,
-			struct rb_node *rb_parent)
-{
-	struct address_space *mapping = NULL;
-
-	if (vma->vm_file) {
-		mapping = vma->vm_file->f_mapping;
-		mutex_lock(&mapping->i_mmap_mutex);
-	}
-
-	__vma_link(mm, vma, prev, rb_link, rb_parent);
-	__vma_link_file(vma);
-
-	if (mapping)
-		mutex_unlock(&mapping->i_mmap_mutex);
-
-	mm->map_count++;
-	validate_mm(mm);
-}
-
-/*
- * Helper for vma_adjust() in the split_vma insert case: insert a vma into the
- * mm's list and rbtree.  It has already been inserted into the interval tree.
- */
-static void __insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
-{
-	struct vm_area_struct *prev;
-	struct rb_node **rb_link, *rb_parent;
-
-	if (find_vma_links(mm, vma->vm_start, vma->vm_end,
-			   &prev, &rb_link, &rb_parent))
-		BUG();
-	__vma_link(mm, vma, prev, rb_link, rb_parent);
-	mm->map_count++;
-}
-
-static inline void
-__vma_unlink(struct mm_struct *mm, struct vm_area_struct *vma,
-		struct vm_area_struct *prev)
-{
-	struct vm_area_struct *next;
-
-	vma_rb_erase(vma, &mm->mm_rb);
-	prev->vm_next = next = vma->vm_next;
-	if (next)
-		next->vm_prev = prev;
-
-	/* Kill the cache */
-	vmacache_invalidate(mm);
-}
-
-/*
- * We cannot adjust vm_start, vm_end, vm_pgoff fields of a vma that
- * is already present in an i_mmap tree without adjusting the tree.
- * The following helper function should be used when such adjustments
- * are necessary.  The "insert" vma (if any) is to be inserted
- * before we drop the necessary locks.
- */
-int vma_adjust(struct vm_area_struct *vma, unsigned long start,
-	unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert)
-{
-	struct mm_struct *mm = vma->vm_mm;
-	struct vm_area_struct *next = vma->vm_next;
-	struct vm_area_struct *importer = NULL;
-	struct address_space *mapping = NULL;
-	struct rb_root *root = NULL;
-	struct anon_vma *anon_vma = NULL;
-	struct file *file = vma->vm_file;
-	bool start_changed = false, end_changed = false;
-	long adjust_next = 0;
-	int remove_next = 0;
-
-	if (next && !insert) {
-		struct vm_area_struct *exporter = NULL;
-
-		if (end >= next->vm_end) {
-			/*
-			 * vma expands, overlapping all the next, and
-			 * perhaps the one after too (mprotect case 6).
-			 */
-again:			remove_next = 1 + (end > next->vm_end);
-			end = next->vm_end;
-			exporter = next;
-			importer = vma;
-		} else if (end > next->vm_start) {
-			/*
-			 * vma expands, overlapping part of the next:
-			 * mprotect case 5 shifting the boundary up.
-			 */
-			adjust_next = (end - next->vm_start) >> PAGE_SHIFT;
-			exporter = next;
-			importer = vma;
-		} else if (end < vma->vm_end) {
-			/*
-			 * vma shrinks, and !insert tells it's not
-			 * split_vma inserting another: so it must be
-			 * mprotect case 4 shifting the boundary down.
-			 */
-			adjust_next = -((vma->vm_end - end) >> PAGE_SHIFT);
-			exporter = vma;
-			importer = next;
-		}
-
-		/*
-		 * Easily overlooked: when mprotect shifts the boundary,
-		 * make sure the expanding vma has anon_vma set if the
-		 * shrinking vma had, to cover any anon pages imported.
-		 */
-		if (exporter && exporter->anon_vma && !importer->anon_vma) {
-			int error;
-
-			error = anon_vma_clone(importer, exporter);
-			if (error)
-				return error;
-			importer->anon_vma = exporter->anon_vma;
-		}
-	}
-
-	if (file) {
-		mapping = file->f_mapping;
-		if (!(vma->vm_flags & VM_NONLINEAR)) {
-			root = &mapping->i_mmap;
-			uprobe_munmap(vma, vma->vm_start, vma->vm_end);
-
-			if (adjust_next)
-				uprobe_munmap(next, next->vm_start,
-							next->vm_end);
-		}
-
-		mutex_lock(&mapping->i_mmap_mutex);
-		if (insert) {
-			/*
-			 * Put into interval tree now, so instantiated pages
-			 * are visible to arm/parisc __flush_dcache_page
-			 * throughout; but we cannot insert into address
-			 * space until vma start or end is updated.
-			 */
-			__vma_link_file(insert);
-		}
-	}
-
-	vma_adjust_trans_huge(vma, start, end, adjust_next);
-
-	anon_vma = vma->anon_vma;
-	if (!anon_vma && adjust_next)
-		anon_vma = next->anon_vma;
-	if (anon_vma) {
-		VM_BUG_ON_VMA(adjust_next && next->anon_vma &&
-			  anon_vma != next->anon_vma, next);
-		anon_vma_lock_write(anon_vma);
-		anon_vma_interval_tree_pre_update_vma(vma);
-		if (adjust_next)
-			anon_vma_interval_tree_pre_update_vma(next);
-	}
-
-	if (root) {
-		flush_dcache_mmap_lock(mapping);
-		vma_interval_tree_remove(vma, root);
-		if (adjust_next)
-			vma_interval_tree_remove(next, root);
-	}
-
-	if (start != vma->vm_start) {
-		vma->vm_start = start;
-		start_changed = true;
-	}
-	if (end != vma->vm_end) {
-		vma->vm_end = end;
-		end_changed = true;
-	}
-	vma->vm_pgoff = pgoff;
-	if (adjust_next) {
-		next->vm_start += adjust_next << PAGE_SHIFT;
-		next->vm_pgoff += adjust_next;
-	}
-
-	if (root) {
-		if (adjust_next)
-			vma_interval_tree_insert(next, root);
-		vma_interval_tree_insert(vma, root);
-		flush_dcache_mmap_unlock(mapping);
-	}
-
-	if (remove_next) {
-		/*
-		 * vma_merge has merged next into vma, and needs
-		 * us to remove next before dropping the locks.
-		 */
-		__vma_unlink(mm, next, vma);
-		if (file)
-			__remove_shared_vm_struct(next, file, mapping);
-	} else if (insert) {
-		/*
-		 * split_vma has split insert from vma, and needs
-		 * us to insert it before dropping the locks
-		 * (it may either follow vma or precede it).
-		 */
-		__insert_vm_struct(mm, insert);
-	} else {
-		if (start_changed)
-			vma_gap_update(vma);
-		if (end_changed) {
-			if (!next)
-				mm->highest_vm_end = end;
-			else if (!adjust_next)
-				vma_gap_update(next);
-		}
-	}
-
-	if (anon_vma) {
-		anon_vma_interval_tree_post_update_vma(vma);
-		if (adjust_next)
-			anon_vma_interval_tree_post_update_vma(next);
-		anon_vma_unlock_write(anon_vma);
-	}
-	if (mapping)
-		mutex_unlock(&mapping->i_mmap_mutex);
-
-	if (root) {
-		uprobe_mmap(vma);
-
-		if (adjust_next)
-			uprobe_mmap(next);
-	}
-
-	if (remove_next) {
-		if (file) {
-			uprobe_munmap(next, next->vm_start, next->vm_end);
-			fput(file);
-		}
-		if (next->anon_vma)
-			anon_vma_merge(vma, next);
-		mm->map_count--;
-		mpol_put(vma_policy(next));
-		kmem_cache_free(vm_area_cachep, next);
-		/*
-		 * In mprotect's case 6 (see comments on vma_merge),
-		 * we must remove another next too. It would clutter
-		 * up the code too much to do both in one go.
-		 */
-		next = vma->vm_next;
-		if (remove_next == 2)
-			goto again;
-		else if (next)
-			vma_gap_update(next);
-		else
-			mm->highest_vm_end = end;
-	}
-	if (insert && file)
-		uprobe_mmap(insert);
-
-	validate_mm(mm);
-
-	return 0;
-}
-
-/*
- * If the vma has a ->close operation then the driver probably needs to release
- * per-vma resources, so we don't attempt to merge those.
- */
-static inline int is_mergeable_vma(struct vm_area_struct *vma,
-			struct file *file, unsigned long vm_flags)
-{
-	/*
-	 * VM_SOFTDIRTY should not prevent from VMA merging, if we
-	 * match the flags but dirty bit -- the caller should mark
-	 * merged VMA as dirty. If dirty bit won't be excluded from
-	 * comparison, we increase pressue on the memory system forcing
-	 * the kernel to generate new VMAs when old one could be
-	 * extended instead.
-	 */
-	if ((vma->vm_flags ^ vm_flags) & ~VM_SOFTDIRTY)
-		return 0;
-	if (vma->vm_file != file)
-		return 0;
-	if (vma->vm_ops && vma->vm_ops->close)
-		return 0;
-	return 1;
-}
-
-static inline int is_mergeable_anon_vma(struct anon_vma *anon_vma1,
-					struct anon_vma *anon_vma2,
-					struct vm_area_struct *vma)
-{
-	/*
-	 * The list_is_singular() test is to avoid merging VMA cloned from
-	 * parents. This can improve scalability caused by anon_vma lock.
-	 */
-	if ((!anon_vma1 || !anon_vma2) && (!vma ||
-		list_is_singular(&vma->anon_vma_chain)))
-		return 1;
-	return anon_vma1 == anon_vma2;
-}
-
-/*
- * Return true if we can merge this (vm_flags,anon_vma,file,vm_pgoff)
- * in front of (at a lower virtual address and file offset than) the vma.
- *
- * We cannot merge two vmas if they have differently assigned (non-NULL)
- * anon_vmas, nor if same anon_vma is assigned but offsets incompatible.
- *
- * We don't check here for the merged mmap wrapping around the end of pagecache
- * indices (16TB on ia32) because do_mmap_pgoff() does not permit mmap's which
- * wrap, nor mmaps which cover the final page at index -1UL.
- */
-static int
-can_vma_merge_before(struct vm_area_struct *vma, unsigned long vm_flags,
-	struct anon_vma *anon_vma, struct file *file, pgoff_t vm_pgoff)
-{
-	if (is_mergeable_vma(vma, file, vm_flags) &&
-	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
-		if (vma->vm_pgoff == vm_pgoff)
-			return 1;
-	}
-	return 0;
-}
-
-/*
- * Return true if we can merge this (vm_flags,anon_vma,file,vm_pgoff)
- * beyond (at a higher virtual address and file offset than) the vma.
- *
- * We cannot merge two vmas if they have differently assigned (non-NULL)
- * anon_vmas, nor if same anon_vma is assigned but offsets incompatible.
- */
-static int
-can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
-	struct anon_vma *anon_vma, struct file *file, pgoff_t vm_pgoff)
-{
-	if (is_mergeable_vma(vma, file, vm_flags) &&
-	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
-		pgoff_t vm_pglen;
-		vm_pglen = vma_pages(vma);
-		if (vma->vm_pgoff + vm_pglen == vm_pgoff)
-			return 1;
-	}
-	return 0;
-}
-
-/*
- * Given a mapping request (addr,end,vm_flags,file,pgoff), figure out
- * whether that can be merged with its predecessor or its successor.
- * Or both (it neatly fills a hole).
- *
- * In most cases - when called for mmap, brk or mremap - [addr,end) is
- * certain not to be mapped by the time vma_merge is called; but when
- * called for mprotect, it is certain to be already mapped (either at
- * an offset within prev, or at the start of next), and the flags of
- * this area are about to be changed to vm_flags - and the no-change
- * case has already been eliminated.
- *
- * The following mprotect cases have to be considered, where AAAA is
- * the area passed down from mprotect_fixup, never extending beyond one
- * vma, PPPPPP is the prev vma specified, and NNNNNN the next vma after:
- *
- *     AAAA             AAAA            e ***rb_link, struct rb_node **rb_parent)
+		struct rb_node ***rb_link, struct rb_node **rb_parent)
 {
 	struct rb_node **__rb_link, *__rb_parent, *rb_prev;
 
@@ -1468,7 +1024,7 @@ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
  * vma, PPPPPP is the prev vma specified, and NNNNNN the next vma after:
  *
  *     AAAA             AAAA                AAAA          AAAA
- *    PPPPPPNNNNNN    PPPPPPNNNNNN    ePPPPPPNNNNNN    PPPPNNNNXXXX
+ *    PPPPPPNNNNNN    PPPPPPNNNNNN    PPPPPPNNNNNN    PPPPNNNNXXXX
  *    cannot merge    might become    might become    might become
  *                    PPNNNNNNNNNN    PPPPPPPPPPNN    PPPPPPPPPPPP 6 or
  *    mmap, brk or    case 4 below    case 5 below    PPPPPPPPXXXX 7 or
@@ -1808,55 +1364,57 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 			return -EINVAL;
 		}
 #ifdef CONFIG_MAPPING_CACHE
-		struct list_head *entry;
-		struct mapping_history *mhtarget, *new;
-		char * file_path;
-		struct path *path;
-		int count = 0;
-		char *tmp;
-
-		//0. find file path
-		path = &file->f_path;
-		path_get(path);
-
-		tmp = (char *)__get_free_page(GFP_TEMPORARY);
+		if(flags & MAP_SHARED){
+			struct list_head *entry;
+			struct mapping_history *mhtarget, *new;
+			char * file_path;
+			struct path *path;
+			int count = 0;
+			char *tmp;
 	
-		if(!tmp){
-			path_put(path);
-			return -ENOMEM;
-		}
-
-		file_path = d_path(path, tmp, PAGE_SIZE);
-		path_put(path);
-
-		if(IS_ERR(file_path)){
-			free_page((unsigned long) tmp);
-			return PTR_ERR(file_path);
-		}
-
-		//1. find from mapping history list of current mm
-		list_for_each(entry, &mm->mhlist){
-			mhtarget = list_entry(entry, struct mapping_history, list);
-			if(!strncmp(file_path, mhtarget->file_path, sizeof(file_path))){
-				count = mhtarget->count ++;
-				free_page((unsigned long)tmp);
-				break;
-			}
-		}
-
-		//2. if not found, allocate history list and append it
-		if(count == 0){
-			new = kmalloc(sizeof(struct mapping_history), GFP_KERNEL);
-			if(!new){
-				printk(KERN_INFO "mapping history struct kmalloc is failed\n");
+			//0. find file path
+			path = &file->f_path;
+			path_get(path);
+	
+			tmp = (char *)__get_free_page(GFP_TEMPORARY);
+	
+			if(!tmp){
+				path_put(path);
 				return -ENOMEM;
 			}
-			new->count = 1;
-			new->file_path = file_path;
-			list_add(new, &mm->mhlist);
-		}
+	
+			file_path = d_path(path, tmp, PAGE_SIZE);
+			path_put(path);
+	
+			if(IS_ERR(file_path)){
+				free_page((unsigned long) tmp);
+				return PTR_ERR(file_path);
+			}
 
-		printk(KERN_INFO "[ARCS] %s file is mmaped with cnt[%d]\n", file_path, count);
+			//1. find from mapping history list of current mm
+			list_for_each(entry, &mm->mhlist.list){
+				mhtarget = list_entry(entry, struct mapping_history, list);
+				if(!strncmp(file_path, mhtarget->file_path, sizeof(file_path))){
+					count = mhtarget->count ++;
+					free_page((unsigned long)tmp);
+					break;
+				}
+			}
+
+			//2. if not found, allocate history list and append it
+			if(count == 0){
+				new = kmalloc(sizeof(struct mapping_history), GFP_KERNEL);
+				if(!new){
+					printk(KERN_INFO "mapping history struct kmalloc is failed\n");
+					return -ENOMEM;
+				}
+				new->count = 1;
+				new->file_path = file_path;
+				list_add(new, &mm->mhlist.list);
+			}
+	
+			printk(KERN_INFO "[ARCS] %s file is mmaped with cnt[%d]\n", file_path, count);
+		}
 #endif
 	} else {
 		switch (flags & MAP_TYPE) {

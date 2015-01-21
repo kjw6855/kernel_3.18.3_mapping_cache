@@ -342,9 +342,27 @@ struct mm_rss_stat {
 };
 
 struct kioctx_table;
+
+/*
+ * Made by Jiwon Kim
+ *
+ * 1. Set History Log
+ *
+ */
+
 #ifndef CONFIG_MAPPING_CACHE
 #define CONFIG_MAPPING_CACHE
 #endif
+
+#ifdef CONFIG_MAPPING_CACHE
+struct mapping_history{
+	struct list_head list;
+	int count;
+	char * file_path;
+	struct inode *inode;
+};
+#endif
+
 struct mm_struct {
 	struct vm_area_struct *mmap;		/* list of VMAs */
 	struct rb_root mm_rb;
@@ -458,24 +476,10 @@ struct mm_struct {
 #endif
 	struct uprobes_state uprobes_state;
 
-/*
- * Made by Jiwon Kim
- * 1. Set History Log
- *
- */
 #ifdef CONFIG_MAPPING_CACHE
 	struct mapping_history mhlist;
 #endif
 };
-
-#ifdef CONFIG_MAPPING_CACHE
-struct mapping_history{
-	struct list_head list;
-	int count;
-	char * file_path;
-	struct inode *inode;
-};
-#endif
 
 static inline void mm_init_cpumask(struct mm_struct *mm)
 {
